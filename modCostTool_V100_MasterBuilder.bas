@@ -72,13 +72,10 @@ Public Sub BuildCostTool_V100_All()
     V100_CreateReportObjects
 
     V100_DeleteFormIfExists "frmV100GeneratedLinesSubform"
-    V100_DeleteFormIfExists "frmV100JobLinesSubform"
-    V100_DeleteFormIfExists "frmJobEstimate"
     V100_DeleteFormIfExists "frmV100GenericEstimate"
     V100_DeleteFormIfExists "frmV100PortfolioOverview"
 
     V100_CreateGeneratedLinesSubform
-    V100_CreateFineTuneForm
     V100_CreateEstimateForm
     V100_CreatePortfolioForm
 
@@ -114,12 +111,6 @@ Private Sub V100_CreateTables()
         "PreparedBy TEXT(255), " & _
         "CreatedAt DATETIME, " & _
         "UpdatedAt DATETIME" & _
-        ");"
-
-    V100_CreateTableIfMissing "tblCategories", _
-        "CREATE TABLE tblCategories (" & _
-        "CategoryName TEXT(100) CONSTRAINT pk_tblCategories PRIMARY KEY, " & _
-        "DisplayOrder LONG" & _
         ");"
 
     V100_CreateTableIfMissing "tblCostLibrary", _
@@ -1089,7 +1080,7 @@ End Sub
 Public Sub V100_ApplyGeneratedToJobLines(ByVal jobID As String)
     On Error GoTo ErrHandler
     Dim rs As DAO.Recordset
-    Dim cat As String, itemID As Long, qty As Double, cost As Double, desiredRateAUD As Double, baseForFineTune As Double
+    Dim cat As String, itemID As Long, qty As Double, cost As Double, desiredRateAUD As Double, baseForV062 As Double
 
     If DCount("*", "tblGeneratedLines", "JobID=" & V100_Q(jobID)) = 0 Then V100_GenerateGenericEstimate jobID
 
@@ -1108,13 +1099,13 @@ Public Sub V100_ApplyGeneratedToJobLines(ByVal jobID As String)
         If cat <> "" And itemID > 0 And cost <> 0 Then
             If qty <= 0 Then qty = cost
             desiredRateAUD = cost / qty
-            baseForFineTune = desiredRateAUD / V100_FineTuneRateMultiplier()
+            baseForV062 = desiredRateAUD / V100_V062Multiplier()
             CurrentDb.Execute "UPDATE tblJobLines SET IncludeItem=True, Quantity=" & V100_SqlNum(qty) & _
                 ", V100GeneratedQuantity=" & V100_SqlNum(qty) & _
                 ", V100GeneratedCostAUD=" & V100_SqlCurrency(cost) & _
                 ", V100IsGenerated=True, V100LastGeneratedAt=Now(), " & _
                 "V100OriginalBaseRateUSD2009=IIf(V100OriginalBaseRateUSD2009 Is Null, BaseUnitRateUSD2009, V100OriginalBaseRateUSD2009), " & _
-                "BaseUnitRateUSD2009=" & V100_SqlCurrency(baseForFineTune) & _
+                "BaseUnitRateUSD2009=" & V100_SqlCurrency(baseForV062) & _
                 " WHERE JobID=" & V100_Q(jobID) & " AND CategoryName=" & V100_Q(cat) & " AND ItemID=" & itemID & ";", dbFailOnError
         End If
         rs.MoveNext
@@ -1133,14 +1124,6 @@ End Sub
 Private Sub V100_BackupJobLines(ByVal jobID As String)
     CurrentDb.Execute "INSERT INTO tblJobLineBackup (BackupAt, JobID, JobLineID, CategoryName, ItemID, IncludeItem, Quantity, BaseUnitRateUSD2009) " & _
         "SELECT Now(), JobID, JobLineID, CategoryName, ItemID, IncludeItem, Quantity, BaseUnitRateUSD2009 FROM tblJobLines WHERE JobID=" & V100_Q(jobID) & ";", dbFailOnError
-End Sub
-
-Private Sub V100_CreateNewJobFromLibrary(ByVal jobID As String, ByVal jobName As String, ByVal preparedBy As String)
-    If DCount("*", "tblJobs", "JobID=" & V100_Q(jobID)) = 0 Then
-        CurrentDb.Execute "INSERT INTO tblJobs (JobID, JobName, PreparedBy, CreatedAt, UpdatedAt) VALUES (" & _
-            V100_Q(jobID) & ", " & V100_Q(jobName) & ", " & V100_Q(preparedBy) & ", Now(), Now());", dbFailOnError
-    End If
-    V100_EnsureJobHasAllActiveLibraryLines jobID
 End Sub
 
 Private Sub V100_EnsureJobHasAllActiveLibraryLines(ByVal jobID As String)
@@ -1170,7 +1153,7 @@ Public Function V100_UI_NewJob() As Boolean
     preparedBy = Trim(InputBox("Prepared by:", "New v1.0 Estimate", ""))
 
     If DCount("*", "tblJobs", "JobID=" & V100_Q(jobID)) = 0 Then
-        V100_CreateNewJobFromLibrary jobID, jobName, preparedBy
+        V062_CreateNewJobFromLibrary jobID, jobName, preparedBy
     End If
     V100_CreateInputIfMissing jobID
     Forms("frmV100GenericEstimate").Requery
@@ -1238,7 +1221,9 @@ Public Function V100_UI_OpenFineTune() As Boolean
     If jobID = "" Then Exit Function
     DoCmd.OpenForm "frmJobEstimate"
     V100_MoveFormToJob "frmJobEstimate", jobID
-    V100_UI_Refresh
+    On Error Resume Next
+    V062_UI_Refresh
+    On Error GoTo 0
     V100_UI_OpenFineTune = True
     Exit Function
 ErrHandler:
@@ -1350,68 +1335,6 @@ Private Sub V100_CreateGeneratedLinesSubform()
     DoCmd.Save acForm, oldName
     DoCmd.Close acForm, oldName, acSaveYes
     DoCmd.Rename "frmV100GeneratedLinesSubform", acForm, oldName
-End Sub
-
-Private Sub V100_CreateFineTuneForm()
-    Dim frm As Form, oldName As String, ctl As Control
-
-    Set frm = CreateForm
-    oldName = frm.Name
-    With frm
-        .RecordSource = "tblJobLines"
-        .Caption = "v1.0 Fine Tune Job Lines"
-        .DefaultView = 2
-        .ViewsAllowed = 2
-        .AllowEdits = True
-        .AllowAdditions = False
-        .AllowDeletions = False
-        .NavigationButtons = True
-        .RecordSelectors = True
-    End With
-    V100_AddDatasheetText oldName, "JobID", "JobID", 0, 0, 1200, True
-    V100_AddDatasheetText oldName, "Include", "IncludeItem", 1200, 0, 700, False
-    V100_AddDatasheetText oldName, "WBS", "WBSSubCode", 1900, 0, 850, True
-    V100_AddDatasheetText oldName, "Category", "CategoryName", 2750, 0, 1600, True
-    V100_AddDatasheetText oldName, "ItemID", "ItemID", 4350, 0, 700, True
-    V100_AddDatasheetText oldName, "Item", "ItemName", 5050, 0, 3600, True
-    V100_AddDatasheetText oldName, "Qty", "Quantity", 8650, 0, 1100, False, "0.00"
-    V100_AddDatasheetText oldName, "Unit", "UnitName", 9750, 0, 900, True
-    V100_AddDatasheetText oldName, "Rate", "BaseUnitRateUSD2009", 10650, 0, 1200, False, "Currency"
-    V100_AddDatasheetText oldName, "Generated", "V100IsGenerated", 11850, 0, 900, True
-    V100_AddDatasheetText oldName, "GenCost", "V100GeneratedCostAUD", 12750, 0, 1300, True, "Currency"
-    DoCmd.Save acForm, oldName
-    DoCmd.Close acForm, oldName, acSaveYes
-    DoCmd.Rename "frmV100JobLinesSubform", acForm, oldName
-
-    Set frm = CreateForm
-    oldName = frm.Name
-    With frm
-        .RecordSource = "tblJobs"
-        .Caption = "v1.0 Fine Tune Estimate"
-        .DefaultView = 0
-        .AllowEdits = True
-        .AllowAdditions = False
-        .NavigationButtons = True
-        .RecordSelectors = False
-        .ScrollBars = 2
-        .Width = 18000
-        .Section(acDetail).Height = 9000
-    End With
-    V100_AddLabel oldName, "lblFineTitle", "v1.0 Fine Tune Job Lines", 360, 300, 6000, 360
-    Forms(oldName).Controls("lblFineTitle").FontSize = 16
-    V100_AddLabel oldName, "lblFineJob", "Job ID", 360, 900, 900, 300
-    V100_AddText oldName, "txtFineJobID", "JobID", 1320, 840, 1600, ""
-    Forms(oldName).Controls("txtFineJobID").Locked = True
-    V100_AddLabel oldName, "lblFineName", "Job name", 3240, 900, 1000, 300
-    V100_AddText oldName, "txtFineJobName", "JobName", 4380, 840, 3600, ""
-    Set ctl = CreateControl(oldName, acSubform, acDetail, , , 360, 1500, 17000, 6900)
-    ctl.Name = "subV100JobLines"
-    ctl.SourceObject = "Form.frmV100JobLinesSubform"
-    ctl.LinkMasterFields = "JobID"
-    ctl.LinkChildFields = "JobID"
-    DoCmd.Save acForm, oldName
-    DoCmd.Close acForm, oldName, acSaveYes
-    DoCmd.Rename "frmJobEstimate", acForm, oldName
 End Sub
 
 Private Sub V100_CreateEstimateForm()
@@ -1684,19 +1607,19 @@ Private Function V100_LabourRate(ByVal labourItemID As Long) As Double
     V100_LabourRate = V100_BaseRate("Labour", labourItemID)
 End Function
 
-Private Function V100_FineTuneRateMultiplier() As Double
-    V100_FineTuneRateMultiplier = V100_GetSettingDbl("InflationFactor", 1) * V100_GetSettingDbl("UsdToAudRate", 1) * (1 + V100_GetSettingDbl("OverheadPct", 0) / 100)
-    If V100_FineTuneRateMultiplier = 0 Then V100_FineTuneRateMultiplier = 1
+Private Function V100_V062Multiplier() As Double
+    V100_V062Multiplier = V100_GetSettingDblFromV062("InflationFactor", 1) * V100_GetSettingDblFromV062("UsdToAudRate", 1) * (1 + V100_GetSettingDblFromV062("OverheadPct", 0) / 100)
+    If V100_V062Multiplier = 0 Then V100_V062Multiplier = 1
 End Function
 
-Private Function V100_GetSettingDbl(ByVal settingName As String, ByVal defaultValue As Double) As Double
+Private Function V100_GetSettingDblFromV062(ByVal settingName As String, ByVal defaultValue As Double) As Double
     On Error GoTo Fallback
     Dim v As Variant
     v = DLookup("SettingValueNumber", "tblSettings", "SettingName=" & V100_Q(settingName))
-    If IsNull(v) Or v = "" Then V100_GetSettingDbl = defaultValue Else V100_GetSettingDbl = CDbl(v)
+    If IsNull(v) Or v = "" Then V100_GetSettingDblFromV062 = defaultValue Else V100_GetSettingDblFromV062 = CDbl(v)
     Exit Function
 Fallback:
-    V100_GetSettingDbl = defaultValue
+    V100_GetSettingDblFromV062 = defaultValue
 End Function
 
 Private Sub V100_MoveFormToJob(ByVal formName As String, ByVal jobID As String)
