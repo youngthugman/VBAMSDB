@@ -1,0 +1,1441 @@
+Option Compare Database
+Option Explicit
+
+' ============================================================
+' Decommissioning Cost Tool - Access Builder v0.6.2 All-in-One
+' ============================================================
+'
+' v0.6.2 focus:
+'   - Keeps the stable v0.5.2 no-tab-control design.
+'   - Uses one main form with a category dropdown and a filtered datasheet subform.
+'   - Keeps only the simple Word-compatible RTF export workflow.
+'   - Replaces the three split reports with one combined report output:
+'       rptJobEstimateReport
+'   - Adds supporting subreports for the one combined report:
+'       rptV062_CategoryBreakdown_Sub
+'       rptV062_WbsSummary_Sub
+'       rptV062_IncludedItems_Sub
+'   - Adds visual Access relationships so the Relationships window is meaningful.
+'   - Keeps relationships non-enforced to avoid breaking test databases during iteration.
+'
+' v0.6.2 fixes/additions:
+'   - Fixes Word/RTF export Type mismatch by treating Access output format as Variant.
+'   - Adds DefaultQuantity to tblPresetItems.
+'   - Applying Radiological / Non-Radiological defaults now also fills Quantity.
+'   - Default preset quantities are manually editable in tblPresetItems.
+'   - Adds a Load Existing Job dropdown on the main form.
+'
+' How to use:
+'   1. Open Access.
+'   2. Create a blank .accdb, or use a copy of your current test .accdb.
+'   3. Press Alt + F11.
+'   4. Insert > Module.
+'   5. Paste this whole module.
+'   6. Run: BuildCostTool_V062_AllInOne
+'
+' Notes:
+'   - Test on a copy first.
+'   - No Python is needed at runtime.
+'   - No tab control is used.
+'   - Settings are still edited manually in tblSettings.
+'   - Export creates one .rtf file that can be opened in Word.
+'
+' ============================================================
+' ENTRY POINT
+' ============================================================
+
+Public Sub BuildCostTool_V062_AllInOne()
+    On Error GoTo ErrHandler
+
+    DoCmd.Hourglass True
+    Application.Echo False
+
+    V062_CreateCoreTables
+    V062_UpdateSchemaForV062
+    V062_CreateIndexes
+    V062_CreateRelationships
+    V062_SeedCategories
+    V062_SeedSettings
+    V062_SeedCostLibrary
+    V062_SeedPresets
+    V062_CreateSavedQueries
+    V062_CreateStarterJobIfMissing "JOB-001", "New Decommissioning Estimate", ""
+
+    V062_DeleteFormIfExists "frmJobEstimate"
+    V062_DeleteFormIfExists "frmJobLinesSubform"
+
+    ' v0.6 replaces the old three-report export with one combined report.
+    V062_DeleteReportIfExists "rptJobEstimateReport"
+    V062_DeleteReportIfExists "rptV062_CategoryBreakdown_Sub"
+    V062_DeleteReportIfExists "rptV062_WbsSummary_Sub"
+    V062_DeleteReportIfExists "rptV062_IncludedItems_Sub"
+
+    ' Clean up older v0.6.1 supporting reports if this is an upgrade run.
+    V062_DeleteReportIfExists "rptV061_CategoryBreakdown_Sub"
+    V062_DeleteReportIfExists "rptV061_WbsSummary_Sub"
+    V062_DeleteReportIfExists "rptV061_IncludedItems_Sub"
+
+    ' Clean up older v0.5.2 reports if they exist.
+    V062_DeleteReportIfExists "rptCostSummary"
+    V062_DeleteReportIfExists "rptIncludedItems"
+    V062_DeleteReportIfExists "rptWbsSummary"
+
+    ' Clean up older v0.6 supporting reports if this is an upgrade run.
+    V062_DeleteReportIfExists "rptV060_CategoryBreakdown_Sub"
+    V062_DeleteReportIfExists "rptV060_WbsSummary_Sub"
+    V062_DeleteReportIfExists "rptV060_IncludedItems_Sub"
+
+    V062_CreateJobLinesSubform
+    V062_CreateReports
+    V062_CreateJobEstimateMainForm
+
+    Application.Echo True
+    DoCmd.Hourglass False
+
+    DoCmd.OpenForm "frmJobEstimate"
+    Forms("frmJobEstimate").Controls("cboCategory").value = "Equipment"
+    V062_FilterJobLines
+
+    MsgBox "Cost Tool v0.6.2 built successfully." & vbCrLf & vbCrLf & _
+           "One combined Word/RTF report is available, visual relationships are added, and existing jobs can be loaded from the dropdown.", _
+           vbInformation, "Build Complete"
+    Exit Sub
+
+ErrHandler:
+    Application.Echo True
+    DoCmd.Hourglass False
+    MsgBox "Build failed: " & Err.Number & vbCrLf & Err.Description, vbCritical, "v0.6.2 Build Error"
+End Sub
+
+' ============================================================
+' TABLE CREATION
+' ============================================================
+
+Private Sub V062_CreateCoreTables()
+    V062_CreateTableIfMissing "tblCategories", _
+        "CREATE TABLE tblCategories (" & _
+        "CategoryName TEXT(100) CONSTRAINT pk_tblCategories PRIMARY KEY, " & _
+        "DisplayOrder LONG NOT NULL" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblSettings", _
+        "CREATE TABLE tblSettings (" & _
+        "SettingName TEXT(100) CONSTRAINT pk_tblSettings PRIMARY KEY, " & _
+        "SettingValueNumber DOUBLE, " & _
+        "SettingValueText TEXT(255), " & _
+        "UpdatedAt DATETIME" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblCostLibrary", _
+        "CREATE TABLE tblCostLibrary (" & _
+        "LibraryID AUTOINCREMENT CONSTRAINT pk_tblCostLibrary PRIMARY KEY, " & _
+        "CategoryName TEXT(100) NOT NULL, " & _
+        "ItemID LONG NOT NULL, " & _
+        "IsActive YESNO NOT NULL, " & _
+        "WBSCode TEXT(50), " & _
+        "WBSSubCode TEXT(50), " & _
+        "ItemName TEXT(255) NOT NULL, " & _
+        "UnitName TEXT(100), " & _
+        "BaseUnitRateUSD2009 CURRENCY NOT NULL, " & _
+        "CreatedAt DATETIME, " & _
+        "UpdatedAt DATETIME" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblPresets", _
+        "CREATE TABLE tblPresets (" & _
+        "PresetName TEXT(100) CONSTRAINT pk_tblPresets PRIMARY KEY, " & _
+        "Description TEXT(255)" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblPresetItems", _
+        "CREATE TABLE tblPresetItems (" & _
+        "PresetName TEXT(100) NOT NULL, " & _
+        "CategoryName TEXT(100) NOT NULL, " & _
+        "ItemID LONG NOT NULL, " & _
+        "DefaultQuantity DOUBLE" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblJobs", _
+        "CREATE TABLE tblJobs (" & _
+        "JobID TEXT(50) CONSTRAINT pk_tblJobs PRIMARY KEY, " & _
+        "JobName TEXT(255) NOT NULL, " & _
+        "PreparedBy TEXT(255), " & _
+        "CreatedAt DATETIME, " & _
+        "UpdatedAt DATETIME" & _
+        ");"
+
+    V062_CreateTableIfMissing "tblJobLines", _
+        "CREATE TABLE tblJobLines (" & _
+        "JobLineID AUTOINCREMENT CONSTRAINT pk_tblJobLines PRIMARY KEY, " & _
+        "JobID TEXT(50) NOT NULL, " & _
+        "LibraryID LONG, " & _
+        "CategoryName TEXT(100) NOT NULL, " & _
+        "ItemID LONG NOT NULL, " & _
+        "IncludeItem YESNO NOT NULL, " & _
+        "WBSCode TEXT(50), " & _
+        "WBSSubCode TEXT(50), " & _
+        "ItemName TEXT(255) NOT NULL, " & _
+        "Quantity DOUBLE NOT NULL, " & _
+        "UnitName TEXT(100), " & _
+        "BaseUnitRateUSD2009 CURRENCY NOT NULL" & _
+        ");"
+End Sub
+
+Private Sub V062_CreateTableIfMissing(ByVal tableName As String, ByVal ddl As String)
+    If Not V062_TableExists(tableName) Then
+        CurrentDb.Execute ddl, dbFailOnError
+    End If
+End Sub
+
+Private Function V062_TableExists(ByVal tableName As String) As Boolean
+    Dim tdf As DAO.TableDef
+    For Each tdf In CurrentDb.TableDefs
+        If StrComp(tdf.Name, tableName, vbTextCompare) = 0 Then
+            V062_TableExists = True
+            Exit Function
+        End If
+    Next tdf
+    V062_TableExists = False
+End Function
+
+
+' ============================================================
+' SCHEMA UPDATES FOR v0.6.2
+' ============================================================
+
+Private Sub V062_UpdateSchemaForV062()
+    ' Existing v0.6 databases already have tblPresetItems, but without DefaultQuantity.
+    ' This adds the column safely if it is missing, then gives old preset rows a simple default of 1.
+    V062_AddFieldIfMissing "tblPresetItems", "DefaultQuantity", "DOUBLE"
+
+    On Error Resume Next
+    CurrentDb.Execute "UPDATE tblPresetItems SET DefaultQuantity=1 WHERE DefaultQuantity Is Null;", dbFailOnError
+    On Error GoTo 0
+End Sub
+
+Private Sub V062_AddFieldIfMissing(ByVal tableName As String, ByVal fieldName As String, ByVal fieldTypeSql As String)
+    If V062_FieldExists(tableName, fieldName) Then Exit Sub
+    CurrentDb.Execute "ALTER TABLE " & tableName & " ADD COLUMN " & fieldName & " " & fieldTypeSql & ";", dbFailOnError
+End Sub
+
+Private Function V062_FieldExists(ByVal tableName As String, ByVal fieldName As String) As Boolean
+    On Error GoTo MissingField
+    Dim fld As DAO.Field
+    Set fld = CurrentDb.TableDefs(tableName).Fields(fieldName)
+    V062_FieldExists = True
+    Exit Function
+MissingField:
+    V062_FieldExists = False
+End Function
+
+Private Sub V062_CreateIndexes()
+    V062_CreateIndexIfMissing "tblCostLibrary", "idxCostLibrary_CategoryItem", _
+        "CREATE INDEX idxCostLibrary_CategoryItem ON tblCostLibrary (CategoryName, ItemID);"
+
+    V062_CreateIndexIfMissing "tblPresetItems", "idxPresetItems_Preset", _
+        "CREATE INDEX idxPresetItems_Preset ON tblPresetItems (PresetName, CategoryName, ItemID);"
+
+    V062_CreateIndexIfMissing "tblJobLines", "idxJobLines_Job", _
+        "CREATE INDEX idxJobLines_Job ON tblJobLines (JobID, CategoryName, ItemID);"
+End Sub
+
+Private Sub V062_CreateIndexIfMissing(ByVal tableName As String, ByVal indexName As String, ByVal ddl As String)
+    On Error GoTo CreateIt
+    Dim idx As DAO.Index
+    Set idx = CurrentDb.TableDefs(tableName).Indexes(indexName)
+    Exit Sub
+CreateIt:
+    Err.Clear
+    CurrentDb.Execute ddl, dbFailOnError
+End Sub
+
+
+' ============================================================
+' VISUAL RELATIONSHIPS
+' ============================================================
+'
+' These relationships are intentionally created as non-enforced visual
+' relationships. That means they appear in Database Tools > Relationships,
+' but they do not block testing if old scratch data is messy.
+'
+' This gives the database a proper visual map without adding risky cascade
+' behaviour while the tool is still being iterated.
+
+Private Sub V062_CreateRelationships()
+    V062_CreateRelationshipIfMissing "relV060_Jobs_JobLines", _
+        "tblJobs", "JobID", "tblJobLines", "JobID"
+
+    V062_CreateRelationshipIfMissing "relV060_Categories_CostLibrary", _
+        "tblCategories", "CategoryName", "tblCostLibrary", "CategoryName"
+
+    V062_CreateRelationshipIfMissing "relV060_Categories_JobLines", _
+        "tblCategories", "CategoryName", "tblJobLines", "CategoryName"
+
+    V062_CreateRelationshipIfMissing "relV060_Categories_PresetItems", _
+        "tblCategories", "CategoryName", "tblPresetItems", "CategoryName"
+
+    V062_CreateRelationshipIfMissing "relV060_Presets_PresetItems", _
+        "tblPresets", "PresetName", "tblPresetItems", "PresetName"
+
+    V062_CreateRelationshipIfMissing "relV060_CostLibrary_JobLines", _
+        "tblCostLibrary", "LibraryID", "tblJobLines", "LibraryID"
+End Sub
+
+Private Sub V062_CreateRelationshipIfMissing(ByVal relationName As String, ByVal parentTable As String, ByVal parentField As String, ByVal childTable As String, ByVal childField As String)
+    On Error GoTo CleanFail
+
+    Dim db As DAO.Database
+    Dim rel As DAO.Relation
+    Dim fld As DAO.Field
+
+    If V062_RelationshipExists(relationName) Then Exit Sub
+
+    Set db = CurrentDb
+    Set rel = db.CreateRelation(relationName, parentTable, childTable, dbRelationDontEnforce)
+
+    Set fld = rel.CreateField(parentField)
+    fld.ForeignName = childField
+    rel.Fields.Append fld
+
+    db.Relations.Append rel
+    db.Relations.Refresh
+    Exit Sub
+
+CleanFail:
+    ' Relationship creation should not stop the whole builder.
+    ' If a relationship cannot be added, the rest of the tool can still run.
+    Err.Clear
+End Sub
+
+Private Function V062_RelationshipExists(ByVal relationName As String) As Boolean
+    On Error GoTo NotFound
+    Dim rel As DAO.Relation
+    Set rel = CurrentDb.Relations(relationName)
+    V062_RelationshipExists = True
+    Exit Function
+NotFound:
+    V062_RelationshipExists = False
+End Function
+
+' ============================================================
+' SEED DATA
+' ============================================================
+
+Private Sub V062_SeedCategories()
+    If DCount("*", "tblCategories") > 0 Then Exit Sub
+
+    V062_AddCategory "Equipment", 1
+    V062_AddCategory "Consumables", 2
+    V062_AddCategory "Waste Disposal", 3
+    V062_AddCategory "Labour", 4
+    V062_AddCategory "Area Costs", 5
+End Sub
+
+Private Sub V062_AddCategory(ByVal categoryName As String, ByVal displayOrder As Long)
+    CurrentDb.Execute "INSERT INTO tblCategories (CategoryName, DisplayOrder) VALUES (" & _
+        V062_Q(categoryName) & ", " & displayOrder & ");", dbFailOnError
+End Sub
+
+Private Sub V062_SeedSettings()
+    If DCount("*", "tblSettings") > 0 Then Exit Sub
+
+    V062_AddSettingNumber "InflationFactor", 1.5
+    V062_AddSettingNumber "UsdToAudRate", 1.5
+    V062_AddSettingNumber "OverheadPct", 0
+    V062_AddSettingNumber "ContingencyPct", 0
+    V062_AddSettingText "BaseCurrency", "2009 USD"
+    V062_AddSettingText "OutputCurrency", "AUD"
+End Sub
+
+Private Sub V062_AddSettingNumber(ByVal settingName As String, ByVal valueNumber As Double)
+    CurrentDb.Execute "INSERT INTO tblSettings (SettingName, SettingValueNumber, UpdatedAt) VALUES (" & _
+        V062_Q(settingName) & ", " & V062_SqlNum(valueNumber) & ", Now());", dbFailOnError
+End Sub
+
+Private Sub V062_AddSettingText(ByVal settingName As String, ByVal valueText As String)
+    CurrentDb.Execute "INSERT INTO tblSettings (SettingName, SettingValueText, UpdatedAt) VALUES (" & _
+        V062_Q(settingName) & ", " & V062_Q(valueText) & ", Now());", dbFailOnError
+End Sub
+
+Private Sub V062_SeedCostLibrary()
+    If DCount("*", "tblCostLibrary") > 0 Then Exit Sub
+
+    ' Equipment
+    V062_AddCostItem "Equipment", 1, "1.2", "1.2", "HEPA Filter System", "Per Item", 3598.14
+    V062_AddCostItem "Equipment", 2, "1.2", "1.2", "Replacement Filters", "Per Item", 581.07
+    V062_AddCostItem "Equipment", 3, "1.2", "1.2", "Respirator", "Per Item", 259
+    V062_AddCostItem "Equipment", 4, "1.2", "1.2", "Radiation Vacuum (wet/dry)", "Per Item", 3879
+    V062_AddCostItem "Equipment", 5, "1.2", "1.2", "Rad-Vac filters", "Per Item", 412
+    V062_AddCostItem "Equipment", 6, "1.2", "1.2", "Reciprocating Saws", "Per Item", 1252.26
+    V062_AddCostItem "Equipment", 7, "1.2", "1.2", "Pneumatic Chipping Hammers", "Per Item", 1606.71
+    V062_AddCostItem "Equipment", 8, "1.2", "1.2", "Chipping Hammer Blades", "Per Item", 27.42
+    V062_AddCostItem "Equipment", 9, "1.2", "1.2", "Air Compressor", "Per Item", 1723.44
+    V062_AddCostItem "Equipment", 10, "1.2", "1.2", "JackHammer", "Per Item", 1417.11
+    V062_AddCostItem "Equipment", 11, "1.2", "1.2", "JackHammer Chisels", "Per Item", 24.35
+    V062_AddCostItem "Equipment", 12, "1.2", "1.2", "Safety Glasses", "Per Item", 8.6
+    V062_AddCostItem "Equipment", 13, "1.2", "1.2", "Fall Protection - Harness", "Per Item", 208
+    V062_AddCostItem "Equipment", 14, "1.2", "1.2", "Fall Protection- Lanyard", "Per Item", 367
+    V062_AddCostItem "Equipment", 15, "1.2", "1.2", "Hardhat", "Per Item", 35.5
+    V062_AddCostItem "Equipment", 16, "1.2", "1.2", "Hardhat Hearing Protection", "Per Item", 37.6
+    V062_AddCostItem "Equipment", 17, "1.2", "1.2", "Trailer rental", "Per Item", 416
+    V062_AddCostItem "Equipment", 18, "1.2", "1.2", "Phone & Computer Hook-up", "Per Item", 250
+    V062_AddCostItem "Equipment", 19, "1.2", "1.2", "Instrumentation", "Per Item", 0
+    V062_AddCostItem "Equipment", 20, "1.2", "1.2", "Tractor Loader (Wheeled)", "Per Item", 7160.59
+    V062_AddCostItem "Equipment", 21, "1.2", "1.2", "Skid Steer (Hammer & Wheeled)", "Per Item", 4421.37
+    V062_AddCostItem "Equipment", 22, "1.2", "1.2", "Excavator", "Per Item", 28738.79
+    V062_AddCostItem "Equipment", 23, "1.2", "1.2", "Floor Shaver", "Per Item", 8000
+    V062_AddCostItem "Equipment", 24, "1.2", "1.2", "Wall Shaver", "Per Item", 15000
+    V062_AddCostItem "Equipment", 25, "1.2", "1.2", "Man Lift", "Per Item", 4727.44
+    V062_AddCostItem "Equipment", 26, "1.2", "1.2", "Crane Rental", "Per Item", 15600
+
+    ' Consumables
+    V062_AddCostItem "Consumables", 27, "1.3", "1.3", "Coveralls", "Per Man/Day", 11
+    V062_AddCostItem "Consumables", 28, "1.3", "1.3", "Hoods", "Per Man/Day", 0
+    V062_AddCostItem "Consumables", 29, "1.3", "1.3", "Shoe Covers", "Per Man/Day", 0.94
+    V062_AddCostItem "Consumables", 30, "1.3", "1.3", "Latex Gloves", "Per Man/Day", 0.94
+    V062_AddCostItem "Consumables", 31, "1.3", "1.3", "Rubber Overshoes", "Per Man/Day", 3
+    V062_AddCostItem "Consumables", 32, "1.3", "1.3", "Gloves", "Per Man/Day", 2
+    V062_AddCostItem "Consumables", 33, "1.3", "1.3", "Dosimeters", "Per Man/Year", 200
+    V062_AddCostItem "Consumables", 34, "1.3", "1.3", "TLDs", "Per Man/ Mon", 3
+    V062_AddCostItem "Consumables", 35, "1.3", "1.3", "Bioassays", "Per Man/Year", 250
+
+    ' Waste Disposal
+    V062_AddCostItem "Waste Disposal", 36, "1.4", "1.4", "Industrial Wastes", "Per Tonne", 300
+    V062_AddCostItem "Waste Disposal", 37, "1.4", "1.4", "Hazardous Waste", "Per Tonne", 500
+    V062_AddCostItem "Waste Disposal", 38, "1.4", "1.4", "Low Level Solid Waste (Stored)", "Per Tonne", 0
+    V062_AddCostItem "Waste Disposal", 39, "1.4", "1.4", "Contaminated Waste Cleaning", "Per Hour", 90
+    V062_AddCostItem "Waste Disposal", 40, "1.4", "1.4", "Intermediate Level Solid Waste", "Per Tonne", 0
+
+    ' Labour
+    V062_AddCostItem "Labour", 41, "1.1", "1.1", "Band 1", "Per Hour", 47.55
+    V062_AddCostItem "Labour", 42, "1.1", "1.1", "Band 2", "Per Hour", 54.22
+    V062_AddCostItem "Labour", 43, "1.1", "1.1", "Band 3", "Per Hour", 65.79
+    V062_AddCostItem "Labour", 44, "1.1", "1.1", "Band 4", "Per Hour", 77.19
+    V062_AddCostItem "Labour", 45, "1.1", "1.1", "Band 5", "Per Hour", 89.25
+    V062_AddCostItem "Labour", 46, "1.1", "1.1", "Band 6", "Per Hour", 108.19
+    V062_AddCostItem "Labour", 47, "1.1", "1.1", "Band 7", "Per Hour", 127.28
+    V062_AddCostItem "Labour", 48, "1.1", "1.1", "Band 8", "Per Hour", 157.87
+    V062_AddCostItem "Labour", 49, "1.1", "1.1", "Band 9", "Per Hour", 193.35
+    V062_AddCostItem "Labour", 50, "1.1", "1.1", "Band 10", "Per Hour", 248.91
+
+    ' Area Costs
+    V062_AddCostItem "Area Costs", 1, "1.5", "1.5.1", "remove contaminated pipe insulation", "m", 721.84
+    V062_AddCostItem "Area Costs", 2, "1.5", "1.5.1", "remove asbestos tile", "m^2", 58.25
+    V062_AddCostItem "Area Costs", 3, "1.5", "1.5.2", "System Clean", "m^2", 603.99
+    V062_AddCostItem "Area Costs", 4, "1.5", "1.5.2", "System LLW", "m^2", 414.59
+    V062_AddCostItem "Area Costs", 5, "1.5", "1.5.2", "System Hazardous", "m^2", 11.2
+    V062_AddCostItem "Area Costs", 6, "1.5", "1.5.2", "System Mixed", "m^2", 8.82
+    V062_AddCostItem "Area Costs", 7, "1.5", "1.5.3", "Decon Cleaning", "m^2", 18.15
+    V062_AddCostItem "Area Costs", 9, "1.5", "1.5.3", "Decon Contaminated", "m^2", 427.77
+    V062_AddCostItem "Area Costs", 28, "1.5", "1.5.3", "Soil", "m^2", 31.42
+    V062_AddCostItem "Area Costs", 29, "1.5", "1.5.3", "Pipe - Clean", "m", 528.09
+    V062_AddCostItem "Area Costs", 30, "1.5", "1.5.3", "Pipe - Contaminated", "m", 701.34
+    V062_AddCostItem "Area Costs", 31, "1.5", "1.5.3", "Hot Cell Clean", "m^2", 232.02
+    V062_AddCostItem "Area Costs", 32, "1.5", "1.5.3", "Hot Cell LLW", "m^2", 120.84
+    V062_AddCostItem "Area Costs", 33, "1.5", "1.5.3", "Hot Cell Hazardous", "m^2", 21.15
+    V062_AddCostItem "Area Costs", 34, "1.5", "1.5.4", "Final Survey", "m^2", 242.34
+    V062_AddCostItem "Area Costs", 35, "1.6", "1.6.1", "Remove Building", "m^2", 455.24
+    V062_AddCostItem "Area Costs", 36, "1.6", "1.6.2", "Grade and Seed", "m^2", 15.82
+    V062_AddCostItem "Area Costs", 37, "", "1.6.3", "Backfill", "m^2", 23.79
+End Sub
+
+Private Sub V062_AddCostItem(ByVal categoryName As String, ByVal itemID As Long, ByVal wbsCode As String, ByVal wbsSubCode As String, ByVal itemName As String, ByVal unitName As String, ByVal baseRate As Double)
+    CurrentDb.Execute "INSERT INTO tblCostLibrary " & _
+        "(CategoryName, ItemID, IsActive, WBSCode, WBSSubCode, ItemName, UnitName, BaseUnitRateUSD2009, CreatedAt, UpdatedAt) VALUES (" & _
+        V062_Q(categoryName) & ", " & itemID & ", True, " & V062_Q(wbsCode) & ", " & V062_Q(wbsSubCode) & ", " & V062_Q(itemName) & ", " & V062_Q(unitName) & ", " & V062_SqlNum(baseRate) & ", Now(), Now());", dbFailOnError
+End Sub
+
+Private Sub V062_SeedPresets()
+    If DCount("*", "tblPresets") > 0 Then Exit Sub
+
+    CurrentDb.Execute "INSERT INTO tblPresets (PresetName, Description) VALUES ('Radiological', 'Default included items for radiological estimate');", dbFailOnError
+    CurrentDb.Execute "INSERT INTO tblPresets (PresetName, Description) VALUES ('Non-Radiological', 'Default included items for non-radiological estimate');", dbFailOnError
+
+    ' Radiological defaults
+    V062_AddPresetItem "Radiological", "Equipment", 1
+    V062_AddPresetItem "Radiological", "Equipment", 2
+    V062_AddPresetItem "Radiological", "Equipment", 3
+    V062_AddPresetItem "Radiological", "Equipment", 4
+    V062_AddPresetItem "Radiological", "Equipment", 5
+    V062_AddPresetItem "Radiological", "Equipment", 12
+    V062_AddPresetItem "Radiological", "Equipment", 15
+    V062_AddPresetItem "Radiological", "Equipment", 16
+    V062_AddPresetItem "Radiological", "Consumables", 27
+    V062_AddPresetItem "Radiological", "Consumables", 28
+    V062_AddPresetItem "Radiological", "Consumables", 29
+    V062_AddPresetItem "Radiological", "Consumables", 30
+    V062_AddPresetItem "Radiological", "Consumables", 31
+    V062_AddPresetItem "Radiological", "Consumables", 32
+    V062_AddPresetItem "Radiological", "Consumables", 33
+    V062_AddPresetItem "Radiological", "Consumables", 34
+    V062_AddPresetItem "Radiological", "Consumables", 35
+    V062_AddPresetItem "Radiological", "Waste Disposal", 37
+    V062_AddPresetItem "Radiological", "Waste Disposal", 38
+    V062_AddPresetItem "Radiological", "Waste Disposal", 39
+    V062_AddPresetItem "Radiological", "Waste Disposal", 40
+    V062_AddPresetItem "Radiological", "Labour", 43
+    V062_AddPresetItem "Radiological", "Labour", 44
+    V062_AddPresetItem "Radiological", "Labour", 45
+    V062_AddPresetItem "Radiological", "Area Costs", 3
+    V062_AddPresetItem "Radiological", "Area Costs", 4
+    V062_AddPresetItem "Radiological", "Area Costs", 7
+    V062_AddPresetItem "Radiological", "Area Costs", 9
+    V062_AddPresetItem "Radiological", "Area Costs", 33
+    V062_AddPresetItem "Radiological", "Area Costs", 34
+
+    ' Non-Radiological defaults
+    V062_AddPresetItem "Non-Radiological", "Equipment", 6
+    V062_AddPresetItem "Non-Radiological", "Equipment", 7
+    V062_AddPresetItem "Non-Radiological", "Equipment", 8
+    V062_AddPresetItem "Non-Radiological", "Equipment", 9
+    V062_AddPresetItem "Non-Radiological", "Equipment", 10
+    V062_AddPresetItem "Non-Radiological", "Equipment", 11
+    V062_AddPresetItem "Non-Radiological", "Equipment", 12
+    V062_AddPresetItem "Non-Radiological", "Equipment", 15
+    V062_AddPresetItem "Non-Radiological", "Equipment", 17
+    V062_AddPresetItem "Non-Radiological", "Equipment", 20
+    V062_AddPresetItem "Non-Radiological", "Equipment", 21
+    V062_AddPresetItem "Non-Radiological", "Equipment", 22
+    V062_AddPresetItem "Non-Radiological", "Consumables", 27
+    V062_AddPresetItem "Non-Radiological", "Consumables", 29
+    V062_AddPresetItem "Non-Radiological", "Consumables", 30
+    V062_AddPresetItem "Non-Radiological", "Consumables", 32
+    V062_AddPresetItem "Non-Radiological", "Waste Disposal", 36
+    V062_AddPresetItem "Non-Radiological", "Labour", 42
+    V062_AddPresetItem "Non-Radiological", "Labour", 43
+    V062_AddPresetItem "Non-Radiological", "Labour", 44
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 2
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 3
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 7
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 29
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 34
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 35
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 36
+    V062_AddPresetItem "Non-Radiological", "Area Costs", 37
+End Sub
+
+Private Sub V062_AddPresetItem(ByVal presetName As String, ByVal categoryName As String, ByVal itemID As Long, Optional ByVal defaultQuantity As Double = 1)
+    CurrentDb.Execute "INSERT INTO tblPresetItems (PresetName, CategoryName, ItemID, DefaultQuantity) VALUES (" & _
+        V062_Q(presetName) & ", " & V062_Q(categoryName) & ", " & itemID & ", " & V062_SqlNum(defaultQuantity) & ");", dbFailOnError
+End Sub
+
+' ============================================================
+' QUERIES
+' ============================================================
+
+Private Sub V062_CreateSavedQueries()
+    V062_SaveQuery "qryActiveCostLibrary", _
+        "SELECT tblCostLibrary.* " & _
+        "FROM tblCostLibrary INNER JOIN tblCategories ON tblCostLibrary.CategoryName = tblCategories.CategoryName " & _
+        "WHERE tblCostLibrary.IsActive=True " & _
+        "ORDER BY tblCategories.DisplayOrder, tblCostLibrary.ItemID, tblCostLibrary.ItemName;"
+
+    V062_SaveQuery "qryJobLineAmounts", _
+        "SELECT tblJobLines.JobLineID, tblJobLines.JobID, tblJobLines.LibraryID, tblJobLines.CategoryName, tblJobLines.ItemID, " & _
+        "tblJobLines.IncludeItem, tblJobLines.WBSCode, tblJobLines.WBSSubCode, tblJobLines.ItemName, tblJobLines.Quantity, tblJobLines.UnitName, " & _
+        "tblJobLines.BaseUnitRateUSD2009, " & _
+        "V062_AdjustedRateAUD([BaseUnitRateUSD2009]) AS AdjustedRateAUD, " & _
+        "V062_LineAmountAUD([IncludeItem],[Quantity],[BaseUnitRateUSD2009]) AS AmountAUD " & _
+        "FROM tblJobLines INNER JOIN tblCategories ON tblJobLines.CategoryName = tblCategories.CategoryName " & _
+        "ORDER BY tblJobLines.JobID, tblCategories.DisplayOrder, tblJobLines.ItemID, tblJobLines.ItemName;"
+
+    V062_SaveQuery "qryJobLineEdit", _
+        "SELECT tblJobLines.JobLineID, tblJobLines.JobID, tblJobLines.LibraryID, tblJobLines.CategoryName, tblJobLines.ItemID, " & _
+        "tblJobLines.IncludeItem, tblJobLines.WBSCode, tblJobLines.WBSSubCode, tblJobLines.ItemName, tblJobLines.Quantity, tblJobLines.UnitName, " & _
+        "tblJobLines.BaseUnitRateUSD2009, " & _
+        "V062_AdjustedRateAUD([BaseUnitRateUSD2009]) AS AdjustedRateAUD, " & _
+        "V062_LineAmountAUD([IncludeItem],[Quantity],[BaseUnitRateUSD2009]) AS AmountAUD " & _
+        "FROM tblJobLines;"
+
+    V062_SaveQuery "qryIncludedLineItems", _
+        "SELECT q.* " & _
+        "FROM qryJobLineAmounts AS q INNER JOIN tblCategories AS c ON q.CategoryName = c.CategoryName " & _
+        "WHERE q.IncludeItem=True " & _
+        "ORDER BY q.JobID, c.DisplayOrder, q.ItemID, q.ItemName;"
+
+    V062_SaveQuery "qryCategoryTotals", _
+        "SELECT q.JobID, q.CategoryName, Sum(q.AmountAUD) AS CategoryTotalAUD " & _
+        "FROM qryJobLineAmounts AS q INNER JOIN tblCategories AS c ON q.CategoryName = c.CategoryName " & _
+        "WHERE q.IncludeItem=True " & _
+        "GROUP BY q.JobID, q.CategoryName, c.DisplayOrder " & _
+        "ORDER BY q.JobID, c.DisplayOrder;"
+
+    V062_SaveQuery "qryWbsSummary", _
+        "SELECT JobID, WBSCode, WBSSubCode, Min(ItemName) AS ExampleItem, Sum(AmountAUD) AS WbsTotalAUD " & _
+        "FROM qryJobLineAmounts " & _
+        "WHERE IncludeItem=True " & _
+        "GROUP BY JobID, WBSCode, WBSSubCode " & _
+        "ORDER BY JobID, WBSCode, WBSSubCode;"
+
+    V062_SaveQuery "qryGrandTotals", _
+        "SELECT JobID, Sum(AmountAUD) AS SubtotalAUD, " & _
+        "Sum(AmountAUD) * V062_GetSettingDbl('ContingencyPct',0) / 100 AS ContingencyAUD, " & _
+        "Sum(AmountAUD) * (1 + V062_GetSettingDbl('ContingencyPct',0) / 100) AS GrandTotalAUD " & _
+        "FROM qryJobLineAmounts " & _
+        "WHERE IncludeItem=True " & _
+        "GROUP BY JobID;"
+
+    V062_SaveQuery "qryReportCostSummary", _
+        "SELECT tblJobs.JobID, tblJobs.JobName, tblJobs.PreparedBy, Now() AS GeneratedAt, " & _
+        "V062_GetSettingDbl('InflationFactor',1) AS InflationFactor, " & _
+        "V062_GetSettingDbl('UsdToAudRate',1) AS UsdToAudRate, " & _
+        "V062_GetSettingDbl('OverheadPct',0) AS OverheadPct, " & _
+        "V062_GetSettingDbl('ContingencyPct',0) AS ContingencyPct, " & _
+        "Nz(qryGrandTotals.SubtotalAUD,0) AS SubtotalAUD, " & _
+        "Nz(qryGrandTotals.ContingencyAUD,0) AS ContingencyAUD, " & _
+        "Nz(qryGrandTotals.GrandTotalAUD,0) AS GrandTotalAUD " & _
+        "FROM tblJobs LEFT JOIN qryGrandTotals ON tblJobs.JobID = qryGrandTotals.JobID;"
+
+    ' Optional helper query for manually setting preset quantities.
+    ' Open this query and edit DefaultQuantity, then apply the preset to a job.
+    V062_SaveQuery "qryPresetQuantityEditor", _
+        "SELECT pi.PresetName, pi.CategoryName, pi.ItemID, cl.ItemName, cl.UnitName, pi.DefaultQuantity " & _
+        "FROM tblPresetItems AS pi LEFT JOIN tblCostLibrary AS cl " & _
+        "ON (pi.CategoryName = cl.CategoryName) AND (pi.ItemID = cl.ItemID) " & _
+        "ORDER BY pi.PresetName, pi.CategoryName, pi.ItemID;"
+End Sub
+
+Private Sub V062_SaveQuery(ByVal queryName As String, ByVal sqlText As String)
+    On Error Resume Next
+    CurrentDb.QueryDefs.Delete queryName
+    On Error GoTo 0
+    CurrentDb.CreateQueryDef queryName, sqlText
+End Sub
+
+' ============================================================
+' CALCULATION FUNCTIONS
+' ============================================================
+
+Public Function V062_GetSettingDbl(ByVal settingName As String, Optional ByVal defaultValue As Double = 0) As Double
+    On Error GoTo Fallback
+    Dim v As Variant
+    v = DLookup("SettingValueNumber", "tblSettings", "SettingName=" & V062_Q(settingName))
+    If IsNull(v) Or v = "" Then
+        V062_GetSettingDbl = defaultValue
+    Else
+        V062_GetSettingDbl = CDbl(v)
+    End If
+    Exit Function
+Fallback:
+    V062_GetSettingDbl = defaultValue
+End Function
+
+Public Function V062_AdjustedRateAUD(ByVal baseUnitRateUSD2009 As Variant) As Currency
+    Dim baseRate As Double
+    baseRate = Nz(baseUnitRateUSD2009, 0)
+
+    V062_AdjustedRateAUD = CCur(baseRate * _
+        V062_GetSettingDbl("InflationFactor", 1) * _
+        V062_GetSettingDbl("UsdToAudRate", 1) * _
+        (1 + V062_GetSettingDbl("OverheadPct", 0) / 100))
+End Function
+
+Public Function V062_LineAmountAUD(ByVal includeItem As Variant, ByVal quantity As Variant, ByVal baseUnitRateUSD2009 As Variant) As Currency
+    If Nz(includeItem, False) = False Then
+        V062_LineAmountAUD = 0
+    Else
+        V062_LineAmountAUD = CCur(Nz(quantity, 0) * V062_AdjustedRateAUD(baseUnitRateUSD2009))
+    End If
+End Function
+
+' ============================================================
+' JOB CREATION AND PRESET LOGIC
+' ============================================================
+
+Public Sub V062_CreateStarterJobIfMissing(ByVal jobID As String, ByVal jobName As String, ByVal preparedBy As String)
+    If DCount("*", "tblJobs", "JobID=" & V062_Q(jobID)) > 0 Then Exit Sub
+    V062_CreateNewJobFromLibrary jobID, jobName, preparedBy
+End Sub
+
+Public Sub V062_CreateNewJobFromLibrary(ByVal jobID As String, ByVal jobName As String, ByVal preparedBy As String)
+    If DCount("*", "tblJobs", "JobID=" & V062_Q(jobID)) > 0 Then
+        Err.Raise vbObjectError + 1001, , "JobID already exists: " & jobID
+    End If
+
+    CurrentDb.Execute "INSERT INTO tblJobs (JobID, JobName, PreparedBy, CreatedAt, UpdatedAt) VALUES (" & _
+        V062_Q(jobID) & ", " & V062_Q(jobName) & ", " & V062_Q(preparedBy) & ", Now(), Now());", dbFailOnError
+
+    CurrentDb.Execute "INSERT INTO tblJobLines " & _
+        "(JobID, LibraryID, CategoryName, ItemID, IncludeItem, WBSCode, WBSSubCode, ItemName, Quantity, UnitName, BaseUnitRateUSD2009) " & _
+        "SELECT " & V062_Q(jobID) & " AS JobID, LibraryID, CategoryName, ItemID, False AS IncludeItem, WBSCode, WBSSubCode, ItemName, 0 AS Quantity, UnitName, BaseUnitRateUSD2009 " & _
+        "FROM qryActiveCostLibrary;", dbFailOnError
+End Sub
+
+Public Sub V062_ApplyPresetToJob(ByVal jobID As String, ByVal presetName As String)
+    If DCount("*", "tblJobs", "JobID=" & V062_Q(jobID)) = 0 Then
+        Err.Raise vbObjectError + 1002, , "JobID not found: " & jobID
+    End If
+
+    ' Reset the job first so changing preset does not leave stale quantities behind.
+    CurrentDb.Execute "UPDATE tblJobLines SET IncludeItem=False, Quantity=0 WHERE JobID=" & V062_Q(jobID) & ";", dbFailOnError
+
+    ' Include preset items and copy their editable DefaultQuantity into the job Quantity.
+    CurrentDb.Execute "UPDATE tblJobLines INNER JOIN tblPresetItems " & _
+        "ON (tblJobLines.CategoryName = tblPresetItems.CategoryName) AND (tblJobLines.ItemID = tblPresetItems.ItemID) " & _
+        "SET tblJobLines.IncludeItem=True, tblJobLines.Quantity=Nz(tblPresetItems.DefaultQuantity,1) " & _
+        "WHERE tblJobLines.JobID=" & V062_Q(jobID) & " AND tblPresetItems.PresetName=" & V062_Q(presetName) & ";", dbFailOnError
+End Sub
+
+Public Sub V062_ClearJobInputs(ByVal jobID As String)
+    CurrentDb.Execute "UPDATE tblJobLines SET IncludeItem=False, Quantity=0 WHERE JobID=" & V062_Q(jobID) & ";", dbFailOnError
+End Sub
+
+' ============================================================
+' FRONT END FORMS
+' ============================================================
+
+Private Sub V062_DeleteFormIfExists(ByVal formName As String)
+    On Error Resume Next
+    DoCmd.Close acForm, formName, acSaveNo
+    DoCmd.DeleteObject acForm, formName
+    On Error GoTo 0
+End Sub
+
+Private Sub V062_CreateJobLinesSubform()
+    Dim frm As Form
+    Dim oldName As String
+
+    Set frm = CreateForm
+    oldName = frm.Name
+
+    With frm
+        .RecordSource = "qryJobLineEdit"
+        .Caption = "Job Lines"
+        .DefaultView = 2       ' Datasheet
+        .ViewsAllowed = 2      ' Datasheet only
+        .AllowEdits = True
+        .AllowAdditions = False
+        .AllowDeletions = False
+        .NavigationButtons = True
+        .RecordSelectors = True
+    End With
+
+    ' v0.4 simplification:
+    '   Only create controls for fields the user should see.
+    '   Technical fields stay in the RecordSource for filtering, but are not displayed.
+    '   This avoids fragile ColumnHidden patches.
+    V062_AddDatasheetCheck oldName, "Include", "IncludeItem", 0, 0, 900, False
+    V062_AddDatasheetText oldName, "WBS", "WBSCode", 900, 0, 900, True
+    V062_AddDatasheetText oldName, "WBSSub", "WBSSubCode", 1800, 0, 1100, True
+    V062_AddDatasheetText oldName, "ItemActivity", "ItemName", 2900, 0, 4700, True
+    V062_AddDatasheetText oldName, "Quantity", "Quantity", 7600, 0, 1100, False
+    V062_AddDatasheetText oldName, "Unit", "UnitName", 8700, 0, 1300, True
+    V062_AddDatasheetText oldName, "BaseRate", "BaseUnitRateUSD2009", 10000, 0, 1700, True, "Currency"
+    V062_AddDatasheetText oldName, "AdjustedRate", "AdjustedRateAUD", 11700, 0, 1700, True, "Currency"
+    V062_AddDatasheetText oldName, "AmountAUD", "AmountAUD", 13400, 0, 1700, True, "Currency"
+
+    DoCmd.Save acForm, oldName
+    DoCmd.Close acForm, oldName, acSaveYes
+    DoCmd.Rename "frmJobLinesSubform", acForm, oldName
+End Sub
+
+Private Sub V062_AddDatasheetText(ByVal formName As String, ByVal ctlName As String, ByVal sourceName As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal readOnly As Boolean, Optional ByVal fmt As String = "")
+    Dim ctl As Control
+    Set ctl = CreateControl(formName, acTextBox, acDetail, , sourceName, leftPos, topPos, widthVal, 300)
+    ctl.Name = ctlName
+    ctl.ControlSource = sourceName
+    ctl.ColumnWidth = widthVal
+    ctl.Locked = readOnly
+    ctl.Enabled = True
+    ctl.TabStop = Not readOnly
+    If fmt <> "" Then ctl.Format = fmt
+End Sub
+
+Private Sub V062_AddDatasheetCheck(ByVal formName As String, ByVal ctlName As String, ByVal sourceName As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal readOnly As Boolean)
+    Dim ctl As Control
+    Set ctl = CreateControl(formName, acCheckBox, acDetail, , sourceName, leftPos, topPos, widthVal, 300)
+    ctl.Name = ctlName
+    ctl.ControlSource = sourceName
+    ctl.ColumnWidth = widthVal
+    ctl.Locked = readOnly
+    ctl.Enabled = True
+    ctl.TabStop = Not readOnly
+End Sub
+
+Private Sub V062_CreateJobEstimateMainForm()
+    Dim frm As Form
+    Dim oldName As String
+    Dim ctl As Control
+
+    Set frm = CreateForm
+    oldName = frm.Name
+
+    With frm
+        .RecordSource = "tblJobs"
+        .Caption = "Decommissioning Cost Estimate"
+        .DefaultView = 0
+        .ViewsAllowed = 1
+        .AllowEdits = True
+        .AllowAdditions = False
+        .AllowDeletions = False
+        .NavigationButtons = True
+        .RecordSelectors = False
+        .ScrollBars = 2
+        .Width = 21000
+        .OnCurrent = "=V062_FilterJobLines()"
+    End With
+
+    Set ctl = CreateControl(oldName, acLabel, acDetail, , , 360, 240, 9000, 420)
+    ctl.Name = "lblTitle"
+    ctl.Caption = "Decommissioning Cost Estimate"
+    ctl.FontSize = 18
+    ctl.FontBold = True
+
+    Set ctl = CreateControl(oldName, acLabel, acDetail, , , 360, 720, 13000, 300)
+    ctl.Name = "lblSubtitle"
+    ctl.Caption = "Choose a category, tick IncludeItem, enter Quantity, then refresh totals."
+    ctl.FontSize = 10
+
+    V062_AddLabel oldName, "lblJobID", "Job ID", 360, 1260, 1200, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "JobID", 1560, 1200, 2100, 360)
+    ctl.Name = "txtJobID"
+    ctl.Locked = True
+
+    V062_AddLabel oldName, "lblJobName", "Job name", 3960, 1260, 1200, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "JobName", 5160, 1200, 4800, 360)
+    ctl.Name = "txtJobName"
+
+    V062_AddLabel oldName, "lblPreparedBy", "Prepared by", 10260, 1260, 1500, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "PreparedBy", 11820, 1200, 3600, 360)
+    ctl.Name = "txtPreparedBy"
+
+    V062_AddLabel oldName, "lblLoadJob", "Load job", 15720, 1260, 1200, 300
+    Set ctl = CreateControl(oldName, acComboBox, acDetail, , , 16860, 1200, 3900, 360)
+    ctl.Name = "cboJobSelector"
+    ctl.RowSourceType = "Table/Query"
+    ctl.RowSource = "SELECT JobID, JobName FROM tblJobs ORDER BY UpdatedAt DESC, CreatedAt DESC, JobID;"
+    ctl.ColumnCount = 2
+    ctl.BoundColumn = 1
+    ctl.ColumnWidths = "1800;2100"
+    ctl.LimitToList = True
+    ctl.AfterUpdate = "=V062_UI_LoadSelectedJob()"
+
+    V062_AddLabel oldName, "lblCategory", "Category", 360, 1860, 1200, 300
+    Set ctl = CreateControl(oldName, acComboBox, acDetail, , , 1560, 1800, 3000, 360)
+    ctl.Name = "cboCategory"
+    ctl.RowSourceType = "Table/Query"
+    ctl.RowSource = "SELECT CategoryName FROM tblCategories ORDER BY DisplayOrder;"
+    ctl.ColumnCount = 1
+    ctl.BoundColumn = 1
+    ctl.LimitToList = True
+    ctl.defaultValue = """Equipment"""
+    ctl.AfterUpdate = "=V062_FilterJobLines()"
+
+    V062_AddButton oldName, "cmdNewJob", "New Job", 4860, 1770, 1500, 420, "=V062_UI_NewJob()"
+    V062_AddButton oldName, "cmdRadio", "Radiological Defaults", 6540, 1770, 2700, 420, "=V062_UI_ApplyRadiological()"
+    V062_AddButton oldName, "cmdNonRadio", "Non-Radiological Defaults", 9420, 1770, 3150, 420, "=V062_UI_ApplyNonRadiological()"
+    V062_AddButton oldName, "cmdClear", "Clear Inputs", 12780, 1770, 1800, 420, "=V062_UI_ClearInputs()"
+    V062_AddButton oldName, "cmdRefresh", "Refresh Totals", 14760, 1770, 1980, 420, "=V062_UI_Refresh()"
+    V062_AddButton oldName, "cmdExportRTF", "Export Word Report", 16920, 1770, 2700, 420, "=V062_UI_ExportRTF()"
+
+    Set ctl = CreateControl(oldName, acSubform, acDetail, , , 360, 2460, 19600, 7800)
+    ctl.Name = "subJobLines"
+    ctl.SourceObject = "Form.frmJobLinesSubform"
+    ctl.LinkMasterFields = ""
+    ctl.LinkChildFields = ""
+
+    V062_AddLabel oldName, "lblSubtotal", "Subtotal", 360, 10560, 1500, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "=Nz(DLookUp(""SubtotalAUD"",""qryGrandTotals"",""JobID='"" & [txtJobID] & ""'""),0)", 1860, 10500, 2200, 360)
+    ctl.Name = "txtSubtotal"
+    ctl.Format = "Currency"
+    ctl.Locked = True
+
+    V062_AddLabel oldName, "lblContingency", "Contingency", 4440, 10560, 1650, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "=Nz(DLookUp(""ContingencyAUD"",""qryGrandTotals"",""JobID='"" & [txtJobID] & ""'""),0)", 6180, 10500, 2200, 360)
+    ctl.Name = "txtContingency"
+    ctl.Format = "Currency"
+    ctl.Locked = True
+
+    V062_AddLabel oldName, "lblGrandTotal", "Grand total", 8760, 10560, 1650, 300
+    Set ctl = CreateControl(oldName, acTextBox, acDetail, , "=Nz(DLookUp(""GrandTotalAUD"",""qryGrandTotals"",""JobID='"" & [txtJobID] & ""'""),0)", 10560, 10500, 2400, 420)
+    ctl.Name = "txtGrandTotal"
+    ctl.Format = "Currency"
+    ctl.FontBold = True
+    ctl.FontSize = 12
+    ctl.Locked = True
+
+    Set ctl = CreateControl(oldName, acLabel, acDetail, , , 360, 11100, 15000, 300)
+    ctl.Name = "lblHelp"
+    ctl.Caption = "Pricing factors live in tblSettings. Empty totals usually mean no included items or zero quantities yet."
+    ctl.FontSize = 9
+
+    DoCmd.Save acForm, oldName
+    DoCmd.Close acForm, oldName, acSaveYes
+    DoCmd.Rename "frmJobEstimate", acForm, oldName
+End Sub
+
+Private Sub V062_AddLabel(ByVal formName As String, ByVal controlName As String, ByVal captionText As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal heightVal As Long)
+    Dim ctl As Control
+    Set ctl = CreateControl(formName, acLabel, acDetail, , , leftPos, topPos, widthVal, heightVal)
+    ctl.Name = controlName
+    ctl.Caption = captionText
+    ctl.FontSize = 9
+    ctl.FontBold = True
+End Sub
+
+Private Sub V062_AddButton(ByVal formName As String, ByVal controlName As String, ByVal captionText As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal heightVal As Long, ByVal onClickExpression As String)
+    Dim ctl As Control
+    Set ctl = CreateControl(formName, acCommandButton, acDetail, , , leftPos, topPos, widthVal, heightVal)
+    ctl.Name = controlName
+    ctl.Caption = captionText
+    ctl.OnClick = onClickExpression
+End Sub
+
+
+' ============================================================
+' REPORTS v0.6 - ONE COMBINED WORD/RTF REPORT
+' ============================================================
+'
+' v0.6 creates one user-facing report:
+'   rptJobEstimateReport
+'
+' It also creates three supporting subreports. These are not exported
+' separately. They only exist so the one combined report can contain
+' clean sections for category totals, WBS totals, and line items.
+
+Private Sub V062_DeleteReportIfExists(ByVal reportName As String)
+    On Error Resume Next
+    DoCmd.Close acReport, reportName, acSaveNo
+    DoCmd.DeleteObject acReport, reportName
+    On Error GoTo 0
+End Sub
+
+Private Sub V062_CreateReports()
+    V062_CreateCategoryBreakdownSubreport
+    V062_CreateWbsSummarySubreport
+    V062_CreateIncludedItemsSubreport
+    V062_CreateCombinedJobEstimateReport
+End Sub
+
+Private Sub V062_CreateCategoryBreakdownSubreport()
+    Dim rpt As Report
+    Dim oldName As String
+    Dim ctl As Control
+
+    Set rpt = CreateReport
+    oldName = rpt.Name
+
+    With rpt
+        .RecordSource = "qryCategoryTotals"
+        .Caption = "Category Breakdown Subreport"
+        .Width = 9000
+        .Section(acDetail).Height = 360
+    End With
+
+    V062_ReportText oldName, "CategoryName", 0, 40, 4200, 260, ""
+    Set ctl = V062_ReportText(oldName, "CategoryTotalAUD", 4800, 40, 1800, 260, "Currency")
+    ctl.FontBold = True
+
+    V062_ReportLine oldName, 0, 340, 7000
+
+    DoCmd.Save acReport, oldName
+    DoCmd.Close acReport, oldName, acSaveYes
+    DoCmd.Rename "rptV062_CategoryBreakdown_Sub", acReport, oldName
+End Sub
+
+Private Sub V062_CreateWbsSummarySubreport()
+    Dim rpt As Report
+    Dim oldName As String
+    Dim ctl As Control
+
+    Set rpt = CreateReport
+    oldName = rpt.Name
+
+    With rpt
+        .RecordSource = "qryWbsSummary"
+        .Caption = "WBS Summary Subreport"
+        .Width = 11200
+        .Section(acDetail).Height = 430
+    End With
+
+    V062_ReportText oldName, "WBSCode", 0, 50, 900, 260, ""
+    V062_ReportText oldName, "WBSSubCode", 1100, 50, 1200, 260, ""
+    V062_ReportText oldName, "ExampleItem", 2500, 50, 6200, 260, ""
+    Set ctl = V062_ReportText(oldName, "WbsTotalAUD", 9000, 50, 1800, 260, "Currency")
+    ctl.FontBold = True
+
+    V062_ReportLine oldName, 0, 390, 11200
+
+    DoCmd.Save acReport, oldName
+    DoCmd.Close acReport, oldName, acSaveYes
+    DoCmd.Rename "rptV062_WbsSummary_Sub", acReport, oldName
+End Sub
+
+Private Sub V062_CreateIncludedItemsSubreport()
+    Dim rpt As Report
+    Dim oldName As String
+    Dim ctl As Control
+
+    Set rpt = CreateReport
+    oldName = rpt.Name
+
+    With rpt
+        .RecordSource = "qryIncludedLineItems"
+        .Caption = "Included Items Subreport"
+        .Width = 11500
+        .Section(acDetail).Height = 470
+    End With
+
+    V062_ReportText oldName, "CategoryName", 0, 50, 1100, 260, ""
+    V062_ReportText oldName, "WBSCode", 1150, 50, 650, 260, ""
+    V062_ReportText oldName, "WBSSubCode", 1850, 50, 800, 260, ""
+    V062_ReportText oldName, "ItemName", 2700, 50, 3900, 260, ""
+    V062_ReportText oldName, "Quantity", 6750, 50, 650, 260, ""
+    V062_ReportText oldName, "UnitName", 7450, 50, 850, 260, ""
+    V062_ReportText oldName, "AdjustedRateAUD", 8400, 50, 1200, 260, "Currency"
+    Set ctl = V062_ReportText(oldName, "AmountAUD", 9700, 50, 1300, 260, "Currency")
+    ctl.FontBold = True
+
+    V062_ReportLine oldName, 0, 430, 11100
+
+    DoCmd.Save acReport, oldName
+    DoCmd.Close acReport, oldName, acSaveYes
+    DoCmd.Rename "rptV062_IncludedItems_Sub", acReport, oldName
+End Sub
+
+Private Sub V062_CreateCombinedJobEstimateReport()
+    Dim rpt As Report
+    Dim oldName As String
+    Dim ctl As Control
+
+    Set rpt = CreateReport
+    oldName = rpt.Name
+
+    With rpt
+        .RecordSource = "qryReportCostSummary"
+        .Caption = "Decommissioning Cost Estimate Report"
+        .Width = 12000
+        .Section(acDetail).Height = 12800
+    End With
+
+    ' Main title
+    Set ctl = CreateReportControl(oldName, acLabel, acDetail, , , 360, 240, 10500, 460)
+    ctl.Name = "lblTitle"
+    ctl.Caption = "Decommissioning Cost Estimate Report"
+    ctl.FontSize = 18
+    ctl.FontBold = True
+
+    Set ctl = CreateReportControl(oldName, acLabel, acDetail, , , 360, 760, 10500, 300)
+    ctl.Name = "lblSubtitle"
+    ctl.Caption = "Generated from the Access decommissioning cost estimate database."
+    ctl.FontSize = 9
+
+    ' Job details
+    V062_ReportSectionTitle oldName, "1. Job Details", 360, 1260, 4000
+    V062_ReportLabel oldName, "Job ID", 600, 1680, 1600, 260
+    V062_ReportText oldName, "JobID", 2400, 1680, 2400, 260, ""
+
+    V062_ReportLabel oldName, "Job Name", 600, 2040, 1600, 260
+    V062_ReportText oldName, "JobName", 2400, 2040, 6200, 260, ""
+
+    V062_ReportLabel oldName, "Prepared By", 600, 2400, 1600, 260
+    V062_ReportText oldName, "PreparedBy", 2400, 2400, 4200, 260, ""
+
+    V062_ReportLabel oldName, "Generated", 600, 2760, 1600, 260
+    V062_ReportText oldName, "GeneratedAt", 2400, 2760, 3000, 260, "dd-mmm-yyyy hh:nn"
+
+    ' Cost summary
+    V062_ReportSectionTitle oldName, "2. Cost Summary", 360, 3300, 4000
+    V062_ReportLabel oldName, "Subtotal AUD", 600, 3720, 1800, 280
+    V062_ReportText oldName, "SubtotalAUD", 3000, 3720, 2200, 280, "Currency"
+
+    V062_ReportLabel oldName, "Contingency AUD", 600, 4080, 1800, 280
+    V062_ReportText oldName, "ContingencyAUD", 3000, 4080, 2200, 280, "Currency"
+
+    V062_ReportLabel oldName, "Grand Total AUD", 600, 4470, 2000, 320
+    Set ctl = V062_ReportText(oldName, "GrandTotalAUD", 3000, 4470, 2400, 320, "Currency")
+    ctl.FontBold = True
+    ctl.FontSize = 12
+
+    V062_ReportLabel oldName, "Contingency %", 6500, 3720, 1800, 260
+    V062_ReportText oldName, "ContingencyPct", 8500, 3720, 1000, 260, "0.00"
+
+    V062_ReportLabel oldName, "Overhead %", 6500, 4080, 1800, 260
+    V062_ReportText oldName, "OverheadPct", 8500, 4080, 1000, 260, "0.00"
+
+    V062_ReportLabel oldName, "Inflation Factor", 6500, 4440, 1800, 260
+    V062_ReportText oldName, "InflationFactor", 8500, 4440, 1000, 260, "0.00"
+
+    V062_ReportLabel oldName, "USD to AUD", 6500, 4800, 1800, 260
+    V062_ReportText oldName, "UsdToAudRate", 8500, 4800, 1000, 260, "0.00"
+
+    ' Category breakdown
+    V062_ReportSectionTitle oldName, "3. Category Breakdown", 360, 5400, 5000
+    V062_ReportColumnLabel oldName, "Category", 600, 5820, 3000
+    V062_ReportColumnLabel oldName, "Total AUD", 5160, 5820, 1600
+    V062_AddSubreportControl oldName, "subCategoryBreakdown", "Report.rptV062_CategoryBreakdown_Sub", 600, 6160, 7600, 1200
+
+    ' WBS summary
+    V062_ReportSectionTitle oldName, "4. WBS Summary", 360, 7500, 5000
+    V062_ReportColumnLabel oldName, "WBS", 600, 7920, 800
+    V062_ReportColumnLabel oldName, "WBS Sub", 1700, 7920, 1000
+    V062_ReportColumnLabel oldName, "Example Item", 3100, 7920, 4200
+    V062_ReportColumnLabel oldName, "Total AUD", 9360, 7920, 1500
+    V062_AddSubreportControl oldName, "subWbsSummary", "Report.rptV062_WbsSummary_Sub", 600, 8260, 11200, 1500
+
+    ' Included line items
+    V062_ReportSectionTitle oldName, "5. Included Line Items", 360, 9900, 5000
+    V062_ReportColumnLabel oldName, "Category", 600, 10320, 1100
+    V062_ReportColumnLabel oldName, "WBS", 1750, 10320, 650
+    V062_ReportColumnLabel oldName, "WBS Sub", 2450, 10320, 800
+    V062_ReportColumnLabel oldName, "Item", 3300, 10320, 3900
+    V062_ReportColumnLabel oldName, "Qty", 7350, 10320, 650
+    V062_ReportColumnLabel oldName, "Unit", 8050, 10320, 850
+    V062_ReportColumnLabel oldName, "Rate", 9000, 10320, 1200
+    V062_ReportColumnLabel oldName, "Amount", 10300, 10320, 1300
+    V062_AddSubreportControl oldName, "subIncludedItems", "Report.rptV062_IncludedItems_Sub", 600, 10660, 11200, 1900
+
+    DoCmd.Save acReport, oldName
+    DoCmd.Close acReport, oldName, acSaveYes
+    DoCmd.Rename "rptJobEstimateReport", acReport, oldName
+End Sub
+
+Private Sub V062_AddSubreportControl(ByVal reportName As String, ByVal controlName As String, ByVal sourceObjectName As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal heightVal As Long)
+    Dim ctl As Control
+
+    Set ctl = CreateReportControl(reportName, acSubform, acDetail, , , leftPos, topPos, widthVal, heightVal)
+    ctl.Name = controlName
+    ctl.SourceObject = sourceObjectName
+    ctl.LinkMasterFields = "JobID"
+    ctl.LinkChildFields = "JobID"
+
+    On Error Resume Next
+    ctl.CanGrow = True
+    ctl.CanShrink = True
+    ctl.BorderStyle = 0
+    On Error GoTo 0
+End Sub
+
+Private Sub V062_ReportSectionTitle(ByVal reportName As String, ByVal captionText As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long)
+    Dim ctl As Control
+    Set ctl = CreateReportControl(reportName, acLabel, acDetail, , , leftPos, topPos, widthVal, 320)
+    ctl.Caption = captionText
+    ctl.FontBold = True
+    ctl.FontSize = 12
+    ctl.BackStyle = 0
+End Sub
+
+Private Sub V062_ReportColumnLabel(ByVal reportName As String, ByVal captionText As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long)
+    Dim ctl As Control
+    Set ctl = CreateReportControl(reportName, acLabel, acDetail, , , leftPos, topPos, widthVal, 260)
+    ctl.Caption = captionText
+    ctl.FontBold = True
+    ctl.FontSize = 8
+    ctl.BackStyle = 0
+End Sub
+
+Private Sub V062_ReportLabel(ByVal reportName As String, ByVal captionText As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal heightVal As Long)
+    Dim ctl As Control
+    Set ctl = CreateReportControl(reportName, acLabel, acDetail, , , leftPos, topPos, widthVal, heightVal)
+    ctl.Caption = captionText
+    ctl.FontBold = True
+    ctl.BackStyle = 0
+End Sub
+
+Private Function V062_ReportText(ByVal reportName As String, ByVal sourceName As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long, ByVal heightVal As Long, ByVal fmt As String) As Control
+    Dim ctl As Control
+    Set ctl = CreateReportControl(reportName, acTextBox, acDetail, , sourceName, leftPos, topPos, widthVal, heightVal)
+    ctl.ControlSource = sourceName
+    If fmt <> "" Then ctl.Format = fmt
+
+    On Error Resume Next
+    ctl.BorderStyle = 0
+    ctl.SpecialEffect = 0
+    ctl.BackStyle = 0
+    ctl.CanGrow = True
+    On Error GoTo 0
+
+    Set V062_ReportText = ctl
+End Function
+
+Private Sub V062_ReportLine(ByVal reportName As String, ByVal leftPos As Long, ByVal topPos As Long, ByVal widthVal As Long)
+    Dim ctl As Control
+    Set ctl = CreateReportControl(reportName, acLine, acDetail, , , leftPos, topPos, widthVal, 0)
+End Sub
+
+
+' ============================================================
+' UI FUNCTIONS
+' ============================================================
+
+Public Function V062_FilterJobLines() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim categoryName As String
+    Dim filterText As String
+
+    jobID = V062_CurrentJobID()
+    categoryName = Nz(Forms("frmJobEstimate").Controls("cboCategory").value, "")
+
+    If categoryName = "" Then
+        categoryName = "Equipment"
+        Forms("frmJobEstimate").Controls("cboCategory").value = categoryName
+    End If
+
+    If jobID = "" Then Exit Function
+
+    On Error Resume Next
+    Forms("frmJobEstimate").Controls("cboJobSelector").value = jobID
+    On Error GoTo ErrHandler
+
+    filterText = "JobID=" & V062_Q(jobID) & " AND CategoryName=" & V062_Q(categoryName)
+
+    With Forms("frmJobEstimate").Controls("subJobLines").Form
+        .Filter = filterText
+        .FilterOn = True
+        .Requery
+    End With
+
+    Forms("frmJobEstimate").Recalc
+    V062_FilterJobLines = True
+    Exit Function
+
+ErrHandler:
+    V062_FilterJobLines = False
+End Function
+
+Public Function V062_UI_Refresh() As Boolean
+    On Error Resume Next
+    V062_FilterJobLines
+    V062_RefreshJobSelector
+    Forms("frmJobEstimate").Recalc
+    Forms("frmJobEstimate").Repaint
+    V062_UI_Refresh = True
+End Function
+
+Public Function V062_UI_LoadSelectedJob() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim selectedJobID As String
+    Dim rs As DAO.Recordset
+
+    selectedJobID = Nz(Forms("frmJobEstimate").Controls("cboJobSelector").value, "")
+    If selectedJobID = "" Then Exit Function
+
+    Set rs = Forms("frmJobEstimate").RecordsetClone
+    rs.FindFirst "JobID=" & V062_Q(selectedJobID)
+
+    If Not rs.NoMatch Then
+        Forms("frmJobEstimate").Bookmark = rs.Bookmark
+    End If
+
+    rs.Close
+
+    If Nz(Forms("frmJobEstimate").Controls("cboCategory").value, "") = "" Then
+        Forms("frmJobEstimate").Controls("cboCategory").value = "Equipment"
+    End If
+
+    V062_UI_Refresh
+
+    V062_UI_LoadSelectedJob = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not load selected job:" & vbCrLf & Err.Description, vbExclamation, "Load Job Error"
+    V062_UI_LoadSelectedJob = False
+End Function
+
+Private Sub V062_RefreshJobSelector()
+    On Error Resume Next
+
+    With Forms("frmJobEstimate").Controls("cboJobSelector")
+        .RowSource = "SELECT JobID, JobName FROM tblJobs ORDER BY UpdatedAt DESC, CreatedAt DESC, JobID;"
+        .Requery
+        .value = V062_CurrentJobID()
+    End With
+End Sub
+
+Public Function V062_UI_ApplyRadiological() As Boolean
+    V062_UI_ApplyRadiological = V062_ApplyPresetUI("Radiological")
+End Function
+
+Public Function V062_UI_ApplyNonRadiological() As Boolean
+    V062_UI_ApplyNonRadiological = V062_ApplyPresetUI("Non-Radiological")
+End Function
+
+Private Function V062_ApplyPresetUI(ByVal presetName As String) As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    V062_ApplyPresetToJob jobID, presetName
+    V062_UI_Refresh
+
+    MsgBox presetName & " defaults applied to " & jobID & "." & vbCrLf & _
+           "Quantities were filled from tblPresetItems.DefaultQuantity." & vbCrLf & _
+           "You can still edit Quantity values in the item table before exporting.", _
+           vbInformation, "Defaults Applied"
+
+    V062_ApplyPresetUI = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not apply preset:" & vbCrLf & Err.Description, vbExclamation, "Preset Error"
+    V062_ApplyPresetUI = False
+End Function
+
+Public Function V062_UI_ClearInputs() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    If MsgBox("Clear all Include ticks and quantities for " & jobID & "?", vbQuestion + vbYesNo, "Clear Inputs") <> vbYes Then
+        Exit Function
+    End If
+
+    V062_ClearJobInputs jobID
+    V062_UI_Refresh
+
+    V062_UI_ClearInputs = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not clear inputs:" & vbCrLf & Err.Description, vbExclamation, "Clear Inputs Error"
+    V062_UI_ClearInputs = False
+End Function
+
+Public Function V062_UI_NewJob() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim jobName As String
+    Dim preparedBy As String
+    Dim rs As DAO.Recordset
+
+    jobID = Trim(InputBox("Enter a new Job ID.", "New Job", "JOB-" & Format(Now(), "yyyymmdd-hhnn")))
+    If jobID = "" Then Exit Function
+
+    jobName = Trim(InputBox("Enter the job name.", "New Job", "New Decommissioning Estimate"))
+    If jobName = "" Then jobName = "New Decommissioning Estimate"
+
+    preparedBy = Trim(InputBox("Prepared by:", "New Job", ""))
+
+    V062_CreateNewJobFromLibrary jobID, jobName, preparedBy
+
+    Forms("frmJobEstimate").Requery
+
+    Set rs = Forms("frmJobEstimate").RecordsetClone
+    rs.FindFirst "JobID=" & V062_Q(jobID)
+    If Not rs.NoMatch Then
+        Forms("frmJobEstimate").Bookmark = rs.Bookmark
+    End If
+    rs.Close
+
+    V062_RefreshJobSelector
+    Forms("frmJobEstimate").Controls("cboCategory").value = "Equipment"
+    V062_UI_Refresh
+
+    MsgBox "Created new job: " & jobID, vbInformation, "New Job"
+    V062_UI_NewJob = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not create new job:" & vbCrLf & Err.Description, vbExclamation, "New Job Error"
+    V062_UI_NewJob = False
+End Function
+
+Private Function V062_CurrentJobID() As String
+    On Error GoTo ErrHandler
+    V062_CurrentJobID = Nz(Forms("frmJobEstimate").Controls("txtJobID").value, "")
+    Exit Function
+ErrHandler:
+    V062_CurrentJobID = ""
+End Function
+
+
+Public Function V062_UI_ExportRTF() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim outputFolder As String
+    Dim outputPath As String
+
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    V062_UI_Refresh
+
+    outputFolder = CurrentProject.Path
+    outputPath = outputFolder & "\" & V062_SafeFilePart(jobID) & "_Decommissioning_Cost_Report.rtf"
+
+    V062_OutputFilteredReport "rptJobEstimateReport", "JobID=" & V062_Q(jobID), acFormatRTF, outputPath
+
+    MsgBox "Word-compatible report exported to:" & vbCrLf & outputPath & vbCrLf & vbCrLf & _
+           "Open the .rtf file in Word, then save as .docx or PDF if needed.", _
+           vbInformation, "Export Word Report Complete"
+
+    V062_UI_ExportRTF = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Word report export failed:" & vbCrLf & Err.Description, vbExclamation, "Export Word Report Error"
+    V062_UI_ExportRTF = False
+End Function
+
+Private Sub V062_OutputFilteredReport(ByVal reportName As String, ByVal whereText As String, ByVal outputFormat As Variant, ByVal outputPath As String)
+    On Error GoTo CleanFail
+
+    DoCmd.OpenReport reportName, acViewPreview, , whereText, acHidden
+    DoCmd.OutputTo acOutputReport, reportName, outputFormat, outputPath, False
+    DoCmd.Close acReport, reportName, acSaveNo
+    Exit Sub
+
+CleanFail:
+    On Error Resume Next
+    DoCmd.Close acReport, reportName, acSaveNo
+    Err.Raise Err.Number, , Err.Description
+End Sub
+
+Private Function V062_SafeFilePart(ByVal textValue As String) As String
+    Dim s As String
+    s = textValue
+
+    s = Replace(s, "\", "_")
+    s = Replace(s, "/", "_")
+    s = Replace(s, ":", "_")
+    s = Replace(s, "*", "_")
+    s = Replace(s, "?", "_")
+    s = Replace(s, """", "_")
+    s = Replace(s, "<", "_")
+    s = Replace(s, ">", "_")
+    s = Replace(s, "|", "_")
+    s = Replace(s, " ", "_")
+
+    V062_SafeFilePart = s
+End Function
+
+
+' ============================================================
+' EXPORT HELPERS
+' ============================================================
+
+Public Sub V062_ExportQueryToExcel(ByVal queryName As String, ByVal outputPath As String)
+    DoCmd.TransferSpreadsheet acExport, acSpreadsheetTypeExcel12Xml, queryName, outputPath, True
+End Sub
+
+Public Sub V062_ExportReportToRTF(ByVal reportName As String, ByVal outputPath As String)
+    DoCmd.OutputTo acOutputReport, reportName, acFormatRTF, outputPath, True
+End Sub
+
+' ============================================================
+' SQL HELPERS
+' ============================================================
+
+Private Function V062_Q(ByVal value As Variant) As String
+    If IsNull(value) Then
+        V062_Q = "Null"
+    Else
+        V062_Q = "'" & Replace(CStr(value), "'", "''") & "'"
+    End If
+End Function
+
+Private Function V062_SqlNum(ByVal value As Double) As String
+    V062_SqlNum = Replace(CStr(value), ",", ".")
+End Function
+
+

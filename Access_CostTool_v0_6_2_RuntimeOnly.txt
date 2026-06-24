@@ -1,0 +1,397 @@
+Option Compare Database
+Option Explicit
+
+' ============================================================
+' Decommissioning Cost Tool - Runtime Module v0.6.2
+' ============================================================
+'
+' Purpose:
+'   This is the CLEAN HANDOFF module for a database that has already
+'   been built using BuildCostTool_V062_AllInOne.
+'
+' What this keeps:
+'   - Cost calculation functions used by saved queries
+'   - Main form filtering
+'   - Button logic
+'   - New job creation
+'   - Preset application with DefaultQuantity
+'   - Clear inputs
+'   - One Word-compatible RTF export
+'   - Existing job loading from the Load job dropdown
+'
+' What this removes:
+'   - Table creation
+'   - Query creation
+'   - Form/report creation
+'   - Seed data
+'   - Relationship creation
+'   - Builder/rebuilder code
+'
+' IMPORTANT:
+'   - Do NOT run a build function from this module. There is no builder here.
+'   - Paste this into a standard module after the database has already been built.
+'   - The existing forms, reports, queries, tables, and relationships stay in the .accdb.
+'   - Keep this module because the form buttons and saved queries still call these functions.
+'
+' Suggested module name:
+'   modCostToolRuntime
+'
+' ============================================================
+' CALCULATION FUNCTIONS
+' ============================================================
+
+Public Function V062_GetSettingDbl(ByVal settingName As String, Optional ByVal defaultValue As Double = 0) As Double
+    On Error GoTo Fallback
+
+    Dim v As Variant
+    v = DLookup("SettingValueNumber", "tblSettings", "SettingName=" & V062_Q(settingName))
+
+    If IsNull(v) Or v = "" Then
+        V062_GetSettingDbl = defaultValue
+    Else
+        V062_GetSettingDbl = CDbl(v)
+    End If
+
+    Exit Function
+
+Fallback:
+    V062_GetSettingDbl = defaultValue
+End Function
+
+Public Function V062_AdjustedRateAUD(ByVal baseUnitRateUSD2009 As Variant) As Currency
+    Dim baseRate As Double
+
+    baseRate = Nz(baseUnitRateUSD2009, 0)
+
+    V062_AdjustedRateAUD = CCur(baseRate * _
+        V062_GetSettingDbl("InflationFactor", 1) * _
+        V062_GetSettingDbl("UsdToAudRate", 1) * _
+        (1 + V062_GetSettingDbl("OverheadPct", 0) / 100))
+End Function
+
+Public Function V062_LineAmountAUD(ByVal includeItem As Variant, ByVal quantity As Variant, ByVal baseUnitRateUSD2009 As Variant) As Currency
+    If Nz(includeItem, False) = False Then
+        V062_LineAmountAUD = 0
+    Else
+        V062_LineAmountAUD = CCur(Nz(quantity, 0) * V062_AdjustedRateAUD(baseUnitRateUSD2009))
+    End If
+End Function
+
+' ============================================================
+' JOB CREATION AND PRESET LOGIC
+' ============================================================
+
+Public Sub V062_CreateNewJobFromLibrary(ByVal jobID As String, ByVal jobName As String, ByVal preparedBy As String)
+    If DCount("*", "tblJobs", "JobID=" & V062_Q(jobID)) > 0 Then
+        Err.Raise vbObjectError + 1001, , "JobID already exists: " & jobID
+    End If
+
+    CurrentDb.Execute "INSERT INTO tblJobs (JobID, JobName, PreparedBy, CreatedAt, UpdatedAt) VALUES (" & _
+        V062_Q(jobID) & ", " & V062_Q(jobName) & ", " & V062_Q(preparedBy) & ", Now(), Now());", dbFailOnError
+
+    CurrentDb.Execute "INSERT INTO tblJobLines " & _
+        "(JobID, LibraryID, CategoryName, ItemID, IncludeItem, WBSCode, WBSSubCode, ItemName, Quantity, UnitName, BaseUnitRateUSD2009) " & _
+        "SELECT " & V062_Q(jobID) & " AS JobID, LibraryID, CategoryName, ItemID, False AS IncludeItem, WBSCode, WBSSubCode, ItemName, 0 AS Quantity, UnitName, BaseUnitRateUSD2009 " & _
+        "FROM qryActiveCostLibrary;", dbFailOnError
+End Sub
+
+Public Sub V062_ApplyPresetToJob(ByVal jobID As String, ByVal presetName As String)
+    If DCount("*", "tblJobs", "JobID=" & V062_Q(jobID)) = 0 Then
+        Err.Raise vbObjectError + 1002, , "JobID not found: " & jobID
+    End If
+
+    ' Reset first so switching presets does not leave stale quantities behind.
+    CurrentDb.Execute "UPDATE tblJobLines SET IncludeItem=False, Quantity=0 WHERE JobID=" & V062_Q(jobID) & ";", dbFailOnError
+
+    ' Include preset items and copy editable DefaultQuantity into the job Quantity.
+    CurrentDb.Execute "UPDATE tblJobLines INNER JOIN tblPresetItems " & _
+        "ON (tblJobLines.CategoryName = tblPresetItems.CategoryName) AND (tblJobLines.ItemID = tblPresetItems.ItemID) " & _
+        "SET tblJobLines.IncludeItem=True, tblJobLines.Quantity=Nz(tblPresetItems.DefaultQuantity,1) " & _
+        "WHERE tblJobLines.JobID=" & V062_Q(jobID) & " AND tblPresetItems.PresetName=" & V062_Q(presetName) & ";", dbFailOnError
+End Sub
+
+Public Sub V062_ClearJobInputs(ByVal jobID As String)
+    CurrentDb.Execute "UPDATE tblJobLines SET IncludeItem=False, Quantity=0 WHERE JobID=" & V062_Q(jobID) & ";", dbFailOnError
+End Sub
+
+' ============================================================
+' MAIN FORM UI FUNCTIONS
+' ============================================================
+
+Public Function V062_FilterJobLines() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim categoryName As String
+    Dim filterText As String
+
+    jobID = V062_CurrentJobID()
+    categoryName = Nz(Forms("frmJobEstimate").Controls("cboCategory").value, "")
+
+    If categoryName = "" Then
+        categoryName = "Equipment"
+        Forms("frmJobEstimate").Controls("cboCategory").value = categoryName
+    End If
+
+    If jobID = "" Then Exit Function
+
+    On Error Resume Next
+    Forms("frmJobEstimate").Controls("cboJobSelector").value = jobID
+    On Error GoTo ErrHandler
+
+    filterText = "JobID=" & V062_Q(jobID) & " AND CategoryName=" & V062_Q(categoryName)
+
+    With Forms("frmJobEstimate").Controls("subJobLines").Form
+        .Filter = filterText
+        .FilterOn = True
+        .Requery
+    End With
+
+    Forms("frmJobEstimate").Recalc
+
+    V062_FilterJobLines = True
+    Exit Function
+
+ErrHandler:
+    V062_FilterJobLines = False
+End Function
+
+Public Function V062_UI_Refresh() As Boolean
+    On Error Resume Next
+
+    V062_FilterJobLines
+    V062_RefreshJobSelector
+    Forms("frmJobEstimate").Recalc
+    Forms("frmJobEstimate").Repaint
+
+    V062_UI_Refresh = True
+End Function
+
+Public Function V062_UI_LoadSelectedJob() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim selectedJobID As String
+    Dim rs As DAO.Recordset
+
+    selectedJobID = Nz(Forms("frmJobEstimate").Controls("cboJobSelector").value, "")
+    If selectedJobID = "" Then Exit Function
+
+    Set rs = Forms("frmJobEstimate").RecordsetClone
+    rs.FindFirst "JobID=" & V062_Q(selectedJobID)
+
+    If Not rs.NoMatch Then
+        Forms("frmJobEstimate").Bookmark = rs.Bookmark
+    End If
+
+    rs.Close
+
+    If Nz(Forms("frmJobEstimate").Controls("cboCategory").value, "") = "" Then
+        Forms("frmJobEstimate").Controls("cboCategory").value = "Equipment"
+    End If
+
+    V062_UI_Refresh
+
+    V062_UI_LoadSelectedJob = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not load selected job:" & vbCrLf & Err.Description, vbExclamation, "Load Job Error"
+    V062_UI_LoadSelectedJob = False
+End Function
+
+Private Sub V062_RefreshJobSelector()
+    On Error Resume Next
+
+    With Forms("frmJobEstimate").Controls("cboJobSelector")
+        .RowSource = "SELECT JobID, JobName FROM tblJobs ORDER BY UpdatedAt DESC, CreatedAt DESC, JobID;"
+        .Requery
+        .value = V062_CurrentJobID()
+    End With
+End Sub
+
+Public Function V062_UI_ApplyRadiological() As Boolean
+    V062_UI_ApplyRadiological = V062_ApplyPresetUI("Radiological")
+End Function
+
+Public Function V062_UI_ApplyNonRadiological() As Boolean
+    V062_UI_ApplyNonRadiological = V062_ApplyPresetUI("Non-Radiological")
+End Function
+
+Private Function V062_ApplyPresetUI(ByVal presetName As String) As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    V062_ApplyPresetToJob jobID, presetName
+    V062_UI_Refresh
+
+    MsgBox presetName & " defaults applied to " & jobID & "." & vbCrLf & _
+           "Quantities were filled from tblPresetItems.DefaultQuantity." & vbCrLf & _
+           "You can still edit Quantity values in the item table before exporting.", _
+           vbInformation, "Defaults Applied"
+
+    V062_ApplyPresetUI = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not apply preset:" & vbCrLf & Err.Description, vbExclamation, "Preset Error"
+    V062_ApplyPresetUI = False
+End Function
+
+Public Function V062_UI_ClearInputs() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    If MsgBox("Clear all Include ticks and quantities for " & jobID & "?", vbQuestion + vbYesNo, "Clear Inputs") <> vbYes Then
+        Exit Function
+    End If
+
+    V062_ClearJobInputs jobID
+    V062_UI_Refresh
+
+    V062_UI_ClearInputs = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not clear inputs:" & vbCrLf & Err.Description, vbExclamation, "Clear Inputs Error"
+    V062_UI_ClearInputs = False
+End Function
+
+Public Function V062_UI_NewJob() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim jobName As String
+    Dim preparedBy As String
+    Dim rs As DAO.Recordset
+
+    jobID = Trim(InputBox("Enter a new Job ID.", "New Job", "JOB-" & Format(Now(), "yyyymmdd-hhnn")))
+    If jobID = "" Then Exit Function
+
+    jobName = Trim(InputBox("Enter the job name.", "New Job", "New Decommissioning Estimate"))
+    If jobName = "" Then jobName = "New Decommissioning Estimate"
+
+    preparedBy = Trim(InputBox("Prepared by:", "New Job", ""))
+
+    V062_CreateNewJobFromLibrary jobID, jobName, preparedBy
+
+    Forms("frmJobEstimate").Requery
+
+    Set rs = Forms("frmJobEstimate").RecordsetClone
+    rs.FindFirst "JobID=" & V062_Q(jobID)
+
+    If Not rs.NoMatch Then
+        Forms("frmJobEstimate").Bookmark = rs.Bookmark
+    End If
+
+    rs.Close
+
+    V062_RefreshJobSelector
+    Forms("frmJobEstimate").Controls("cboCategory").value = "Equipment"
+    V062_UI_Refresh
+
+    MsgBox "Created new job: " & jobID, vbInformation, "New Job"
+
+    V062_UI_NewJob = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Could not create new job:" & vbCrLf & Err.Description, vbExclamation, "New Job Error"
+    V062_UI_NewJob = False
+End Function
+
+Private Function V062_CurrentJobID() As String
+    On Error GoTo ErrHandler
+
+    V062_CurrentJobID = Nz(Forms("frmJobEstimate").Controls("txtJobID").value, "")
+    Exit Function
+
+ErrHandler:
+    V062_CurrentJobID = ""
+End Function
+
+' ============================================================
+' WORD-COMPATIBLE RTF EXPORT
+' ============================================================
+
+Public Function V062_UI_ExportRTF() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim jobID As String
+    Dim outputFolder As String
+    Dim outputPath As String
+
+    jobID = V062_CurrentJobID()
+    If jobID = "" Then Exit Function
+
+    V062_UI_Refresh
+
+    outputFolder = CurrentProject.Path
+    outputPath = outputFolder & "\" & V062_SafeFilePart(jobID) & "_Decommissioning_Cost_Report.rtf"
+
+    V062_OutputFilteredReport "rptJobEstimateReport", "JobID=" & V062_Q(jobID), acFormatRTF, outputPath
+
+    MsgBox "Word-compatible report exported to:" & vbCrLf & outputPath & vbCrLf & vbCrLf & _
+           "Open the .rtf file in Word, then save as .docx or PDF if needed.", _
+           vbInformation, "Export Word Report Complete"
+
+    V062_UI_ExportRTF = True
+    Exit Function
+
+ErrHandler:
+    MsgBox "Word report export failed:" & vbCrLf & Err.Description, vbExclamation, "Export Word Report Error"
+    V062_UI_ExportRTF = False
+End Function
+
+Private Sub V062_OutputFilteredReport(ByVal reportName As String, ByVal whereText As String, ByVal outputFormat As Variant, ByVal outputPath As String)
+    On Error GoTo CleanFail
+
+    DoCmd.OpenReport reportName, acViewPreview, , whereText, acHidden
+    DoCmd.OutputTo acOutputReport, reportName, outputFormat, outputPath, False
+    DoCmd.Close acReport, reportName, acSaveNo
+
+    Exit Sub
+
+CleanFail:
+    On Error Resume Next
+    DoCmd.Close acReport, reportName, acSaveNo
+    Err.Raise Err.Number, , Err.Description
+End Sub
+
+Private Function V062_SafeFilePart(ByVal textValue As String) As String
+    Dim s As String
+
+    s = textValue
+
+    s = Replace(s, "\", "_")
+    s = Replace(s, "/", "_")
+    s = Replace(s, ":", "_")
+    s = Replace(s, "*", "_")
+    s = Replace(s, "?", "_")
+    s = Replace(s, """", "_")
+    s = Replace(s, "<", "_")
+    s = Replace(s, ">", "_")
+    s = Replace(s, "|", "_")
+    s = Replace(s, " ", "_")
+
+    V062_SafeFilePart = s
+End Function
+
+' ============================================================
+' SQL HELPER
+' ============================================================
+
+Private Function V062_Q(ByVal value As Variant) As String
+    If IsNull(value) Then
+        V062_Q = "Null"
+    Else
+        V062_Q = "'" & Replace(CStr(value), "'", "''") & "'"
+    End If
+End Function
